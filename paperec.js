@@ -20,6 +20,7 @@
   // Enable via: localStorage.setItem('paperec_debug','1') then reload,
   // or at runtime: window.paperecDebug(true)
   let debugEnabled = localStorage.getItem(DEBUG_KEY) === '1';
+  let storageWriteWarned = false;
   const log = (...args) => debugEnabled && console.log('[Paperec]', ...args);
   const warn = (...args) => debugEnabled && console.warn('[Paperec]', ...args);
 
@@ -36,14 +37,14 @@
       'display: flex',
       'flex-direction: column',
       'gap: 8px',
-      'max-width: min(420px, calc(100vw - 28px))',
+      'max-width: min(280px, calc(100vw - 28px))',
       'pointer-events: none',
     ].join(';');
     document.body.appendChild(root);
     return root;
   }
 
-  function toast(message, type = 'info', duration = 2800) {
+  function toast(message, type = 'info', duration = 4200) {
     if (!message) return;
 
     const colors = {
@@ -54,7 +55,9 @@
     };
 
     const item = document.createElement('div');
-    item.textContent = String(message);
+    const messageText = String(message);
+    item.textContent = messageText;
+    item.title = messageText;
     item.style.cssText = [
       `background: ${colors[type] || colors.info}`,
       'color: #fff',
@@ -66,9 +69,11 @@
       'opacity: 0',
       'transform: translateY(-4px)',
       'transition: opacity 0.18s ease, transform 0.18s ease',
-      'white-space: pre-wrap',
-      'word-break: break-word',
-      'pointer-events: none',
+      'max-width: 100%',
+      'white-space: nowrap',
+      'overflow: hidden',
+      'text-overflow: ellipsis',
+      'pointer-events: auto',
     ].join(';');
 
     const root = getToastRoot();
@@ -124,6 +129,21 @@
     return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   }
 
+  function normalizeRankedIds(rankedIds) {
+    const rankedOrder = [];
+    const rankedSeen = new Set();
+    if (!Array.isArray(rankedIds)) return rankedOrder;
+
+    rankedIds.forEach((id) => {
+      const normalized = id == null ? '' : String(id).trim();
+      if (!normalized || rankedSeen.has(normalized)) return;
+      rankedSeen.add(normalized);
+      rankedOrder.push(normalized);
+    });
+
+    return rankedOrder;
+  }
+
   function normalizePaperMeta(meta = {}) {
     return {
       title: typeof meta.title === 'string' ? meta.title : '',
@@ -149,9 +169,28 @@
     window.paperMeta[paperId] = normalizePaperMeta(window.paperMeta[paperId]);
   });
 
+  function getPersistedPaperMeta() {
+    const persisted = {};
+    Object.entries(window.paperMeta).forEach(([paperId, rawMeta]) => {
+      const meta = normalizePaperMeta(rawMeta);
+      if (!isValidRating(meta.rating)) return;
+      persisted[paperId] = meta;
+    });
+    return persisted;
+  }
+
   function savePaperMeta() {
-    localStorage.setItem(PAPERS_KEY, JSON.stringify(window.paperMeta));
     syncRatingsFromMeta();
+    try {
+      localStorage.setItem(PAPERS_KEY, JSON.stringify(getPersistedPaperMeta()));
+      storageWriteWarned = false;
+    } catch (error) {
+      if (!storageWriteWarned) {
+        storageWriteWarned = true;
+        console.warn('[Paperec] failed to persist ratings to localStorage', error);
+        toast('Cannot persist ratings in localStorage; page features still work in this session.', 'warning', 4200);
+      }
+    }
   }
 
   syncRatingsFromMeta();
@@ -296,6 +335,7 @@
     const divs = document.querySelectorAll('div.papers > div');
     log(`initPapers: scanning ${divs.length} paper div(s)`);
     let newCount = 0;
+    let metaChanged = false;
     divs.forEach((div) => {
       const h2 = div.querySelector('h2.title');
       if (!h2) return;
@@ -312,13 +352,36 @@
         date: prev.date,
         rating: prev.rating,
       };
-      savePaperMeta();
+      metaChanged = true;
       log('cached meta for', paperId, window.paperMeta[paperId].title);
 
       renderStars(paperId, h2);
       newCount++;
     });
+    if (metaChanged) savePaperMeta();
     if (newCount > 0) log(`initPapers: injected ${newCount} new widget(s)`);
+  }
+
+  function getPaperContainerState() {
+    const container = document.querySelector('div.papers');
+    const divMap = new Map();
+
+    if (container) {
+      container.querySelectorAll(':scope > div').forEach((div) => {
+        const link = div.querySelector('h2.title a.title-link');
+        if (link && link.id) divMap.set(link.id, div);
+      });
+    }
+
+    return {
+      container,
+      divMap,
+      ids: [...divMap.keys()],
+    };
+  }
+
+  function getCurrentPaperIds() {
+    return getPaperContainerState().ids;
   }
 
   function downloadBlob(blob, filename) {
@@ -356,38 +419,78 @@
   // ── Recommendation ────────────────────────────────────────────────────────
 
   let paperecInFlight = false;
-  let autoPaperecTriggered = false;
+  let frozenOrderedIds = [];
+  let queuedCandidateIds = [];
+  let queuedPreservePrefix = false;
+  let refreshSettleTimer = null;
+  const REFRESH_SETTLE_MS = 700;
+
+  function queueCandidateRanking(candidateIds, preservePrefix) {
+    const merged = new Set([...queuedCandidateIds, ...candidateIds]);
+    queuedCandidateIds = [...merged];
+    queuedPreservePrefix = queuedPreservePrefix || preservePrefix;
+  }
+
+  function scheduleRefreshReorder(reason = 'mutation') {
+    if (refreshSettleTimer) clearTimeout(refreshSettleTimer);
+
+    refreshSettleTimer = setTimeout(() => {
+      refreshSettleTimer = null;
+      log(`refresh settled (${reason})`);
+
+      initPapers();
+
+      const ratedCorpusCount = Object.keys(getPersistedPaperMeta()).length;
+      if (!ratedCorpusCount) {
+        log('scheduleRefreshReorder: skip ranking (no rated corpus)');
+        return;
+      }
+
+      const currentIds = getCurrentPaperIds();
+      if (!currentIds.length) return;
+
+      const hasFrozenPrefix = frozenOrderedIds.length > 0;
+      const candidateIds = hasFrozenPrefix
+        ? currentIds.filter((id) => !frozenOrderedIds.includes(id))
+        : currentIds;
+
+      if (!candidateIds.length) {
+        log('scheduleRefreshReorder: no new candidate papers to rerank');
+        return;
+      }
+
+      window.paperec(PAPEREC_SERVER, {
+        candidateIds,
+        preservePrefix: hasFrozenPrefix,
+        silentBusy: true,
+        requestSource: reason,
+      });
+    }, REFRESH_SETTLE_MS);
+  }
 
   /**
    * Reorder div.papers > div elements.
    * Rated papers appear first (sorted by score desc), then the server-ranked
    * unrated papers, then any remaining papers not in either list.
    */
-  function reorderPapers(rankedIds) {
-    const container = document.querySelector('div.papers');
+  function reorderPapers(rankedIds, options = {}) {
+    const preservePrefix = options.preservePrefix === true;
+    const updateFrozen = options.updateFrozen !== false;
+
+    const { container, divMap, ids: currentIds } = getPaperContainerState();
     if (!container) {
       warn('reorderPapers: div.papers not found');
       return;
     }
 
-    // Build id → div map from current DOM
-    const divMap = new Map();
-    container.querySelectorAll(':scope > div').forEach((div) => {
-      const link = div.querySelector('h2.title a.title-link');
-      if (link && link.id) divMap.set(link.id, div);
-    });
-
     // Normalize/dedupe ranked ids from server payload
-    const rankedOrder = [];
-    const rankedSeen = new Set();
-    if (Array.isArray(rankedIds)) {
-      rankedIds.forEach((id) => {
-        const normalized = id == null ? '' : String(id).trim();
-        if (!normalized || rankedSeen.has(normalized)) return;
-        rankedSeen.add(normalized);
-        rankedOrder.push(normalized);
-      });
-    }
+    const rankedOrder = normalizeRankedIds(rankedIds);
+
+    const lockedPrefix = preservePrefix
+      ? frozenOrderedIds.filter((id) => divMap.has(id))
+      : [];
+    const lockedSet = new Set(lockedPrefix);
+    const sortableIds = currentIds.filter((id) => !lockedSet.has(id));
 
     // Rated papers first, sorted by score descending
     const ratedSeen = new Set();
@@ -396,18 +499,31 @@
       .sort((a, b) => b[1].rating - a[1].rating)
       .map(([id]) => id)
       .filter((id) => {
-        if (ratedSeen.has(id) || !divMap.has(id)) return false;
+        if (lockedSet.has(id) || ratedSeen.has(id) || !divMap.has(id)) return false;
         ratedSeen.add(id);
         return true;
       });
 
     // Then only ranked-but-unrated papers
-    const rankedUnratedOrder = rankedOrder.filter((id) => !ratedSeen.has(id) && divMap.has(id));
+    const rankedUnratedOrder = rankedOrder.filter(
+      (id) => !lockedSet.has(id) && !ratedSeen.has(id) && divMap.has(id)
+    );
 
-    // Build final order: rated → ranked unrated → remaining
-    const placed = new Set([...ratedOrder, ...rankedUnratedOrder]);
-    const remaining = [...divMap.keys()].filter((id) => !placed.has(id));
-    const orderedIds = [...ratedOrder, ...rankedUnratedOrder, ...remaining];
+    // Build final order: locked prefix → rated → ranked unrated → remaining
+    const placed = new Set([...lockedPrefix, ...ratedOrder, ...rankedUnratedOrder]);
+    const remaining = sortableIds.filter((id) => !placed.has(id));
+    const orderedIds = [...lockedPrefix, ...ratedOrder, ...rankedUnratedOrder, ...remaining];
+
+    if (
+      currentIds.length === orderedIds.length
+      && currentIds.every((id, idx) => id === orderedIds[idx])
+    ) {
+      if (updateFrozen) frozenOrderedIds = orderedIds;
+      log(
+        `reorderPapers: order already up to date (mode=${preservePrefix ? 'tail-only' : 'full'} locked=${lockedPrefix.length} rated=${ratedOrder.length} ranked=${rankedUnratedOrder.length} rest=${remaining.length})`
+      );
+      return;
+    }
 
     // Re-append in order (missing ids are silently skipped)
     for (const id of orderedIds) {
@@ -415,149 +531,217 @@
       if (div) container.appendChild(div);
     }
 
+    if (updateFrozen) frozenOrderedIds = orderedIds;
+
     log(
-      `reorderPapers: ${orderedIds.length} papers reordered (rated=${ratedOrder.length} ranked=${rankedUnratedOrder.length} rest=${remaining.length} rankedInput=${rankedOrder.length})`
+      `reorderPapers: ${orderedIds.length} papers reordered (mode=${preservePrefix ? 'tail-only' : 'full'} locked=${lockedPrefix.length} rated=${ratedOrder.length} ranked=${rankedUnratedOrder.length} rest=${remaining.length} rankedInput=${rankedOrder.length})`
     );
   }
 
   /**
-   * Send current ratings + metadata to the PaperRec server, stream progress
-   * events, and reorder the page when the result arrives.
+   * Send candidate papers + rated corpus to /rank_v2, stream progress events,
+   * and reorder candidate region when the ranking result arrives.
    */
-  window.paperec = async function (serverUrl = PAPEREC_SERVER) {
+  window.paperec = async function (serverUrl = PAPEREC_SERVER, options = {}) {
+    const candidateIdsRequested = Array.isArray(options.candidateIds)
+      ? normalizeRankedIds(options.candidateIds)
+      : getCurrentPaperIds();
+    const preservePrefix = options.preservePrefix === true;
+    const suppressBusyWarning = options.suppressBusyWarning === true || options.silentBusy === true;
+    const requestSource = typeof options.requestSource === 'string' ? options.requestSource : 'manual';
+
     if (paperecInFlight) {
-      const msg = 'Recommendation request is already running.';
-      console.warn(`[Paperec] ${msg}`);
-      toast(msg, 'warning');
+      if (candidateIdsRequested.length > 0) {
+        queueCandidateRanking(candidateIdsRequested, preservePrefix);
+        log(`paperec busy; queued ${candidateIdsRequested.length} candidate(s) from ${requestSource}`);
+      }
+      if (!suppressBusyWarning) {
+        const msg = 'Recommendation request is already running.';
+        console.warn(`[Paperec] ${msg}`);
+        toast(msg, 'warning');
+      }
       return;
     }
 
     paperecInFlight = true;
 
     try {
-    const ratedCount = Object.values(window.paperMeta).filter((meta) => isValidRating(meta.rating)).length;
-    if (!ratedCount) {
-      const msg = 'No ratings yet — rate some papers first.';
-      console.warn(`[Paperec] ${msg}`);
-      toast(msg, 'warning');
-      return;
-    }
+      const corpus = getPersistedPaperMeta();
+      const corpusCount = Object.keys(corpus).length;
+      if (!corpusCount) {
+        const msg = 'No ratings yet — rate some papers first.';
+        console.warn(`[Paperec] ${msg}`);
+        toast(msg, 'warning');
+        return;
+      }
 
-    const payload = {
-      venue_url: location.href,
-      meta: window.paperMeta,
-    };
-
-    const sendingMsg = `Sending ${ratedCount} rating(s) to ${serverUrl}/rank …`;
-    console.log(`[Paperec] ${sendingMsg}`);
-    toast(sendingMsg, 'info', 2200);
-
-    let resp;
-    try {
-      resp = await fetch(`${serverUrl}/rank`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+      const candidate = {};
+      candidateIdsRequested.forEach((paperId) => {
+        if (!window.paperMeta[paperId]) return;
+        candidate[paperId] = normalizePaperMeta(window.paperMeta[paperId]);
       });
-    } catch (err) {
-      const msg = `Cannot reach server: ${err && err.message ? err.message : String(err)}`;
-      console.error('[Paperec]', msg);
-      toast(msg, 'error', 4200);
-      return;
-    }
 
-    if (!resp.ok) {
-      const errorText = await resp.text();
-      const msg = `Server error ${resp.status}${errorText ? `: ${errorText}` : ''}`;
-      console.error('[Paperec]', msg);
-      toast(msg, 'error', 4800);
-      return;
-    }
+      const candidateCount = Object.keys(candidate).length;
+      if (!candidateCount) {
+        log(`paperec: no valid candidates from ${requestSource}`);
+        return;
+      }
 
-    // Read the SSE stream via fetch() ReadableStream
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let hasAppliedRanking = false;
+      const payload = {
+        venue_url: location.href,
+        candidate,
+        corpus,
+      };
 
-    const applyRanking = (rankedIds, source) => {
-      if (!Array.isArray(rankedIds)) return false;
-      if (hasAppliedRanking) {
-        log(`paperRec: ranked IDs from ${source} ignored (already applied)`);
+      const sendingMsg = `Ranking ${candidateCount} candidate(s) with ${corpusCount} rated paper(s)`;
+      console.log(`[Paperec] ${sendingMsg}`);
+      toast(sendingMsg, 'info', 4200);
+
+      let resp;
+      try {
+        resp = await fetch(`${serverUrl}/rank_v2`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+      } catch (err) {
+        const msg = `Cannot reach server: ${err && err.message ? err.message : String(err)}`;
+        console.error('[Paperec]', msg);
+        toast(msg, 'error', 4200);
+        return;
+      }
+
+      if (!resp.ok) {
+        const errorText = await resp.text();
+        const msg = `Server error ${resp.status}${errorText ? `: ${errorText}` : ''}`;
+        console.error('[Paperec]', msg);
+        toast(msg, 'error', 4800);
+        return;
+      }
+
+      // Read the SSE stream via fetch() ReadableStream
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let hasAppliedRanking = false;
+      const candidateSet = new Set(Object.keys(candidate));
+
+      const applyRanking = (rankedIds, source) => {
+        const normalizedRankedIds = normalizeRankedIds(rankedIds)
+          .filter((paperId) => candidateSet.has(paperId));
+        if (!normalizedRankedIds.length) return false;
+        if (hasAppliedRanking) {
+          log(`paperRec: ranked IDs from ${source} ignored (already applied)`);
+          return true;
+        }
+        const msg = `Got ${normalizedRankedIds.length} ranked candidate IDs`;
+        console.log(`[Paperec] ${msg}`);
+        toast(msg, 'success', 4200);
+        reorderPapers(normalizedRankedIds, { preservePrefix });
+        hasAppliedRanking = true;
         return true;
-      }
-      const msg = `Got ${rankedIds.length} ranked IDs (${source}) — reordering page…`;
-      console.log(`[Paperec] ${msg}`);
-      toast(msg, 'success', 2600);
-      reorderPapers(rankedIds);
-      hasAppliedRanking = true;
-      return true;
-    };
+      };
 
-    const parseEvents = (chunk) => {
-      buffer += chunk;
-      // SSE events are separated by double newline
-      const parts = buffer.split('\n\n');
-      buffer = parts.pop(); // last (possibly incomplete) chunk stays
-      for (const raw of parts) {
-        let eventType = 'message';
-        let dataStr = '';
-        for (const line of raw.split('\n')) {
-          if (line.startsWith('event: ')) eventType = line.slice(7).trim();
-          else if (line.startsWith('data: ')) dataStr = line.slice(6).trim();
-        }
-        if (!dataStr) continue;
-        try {
-          const data = JSON.parse(dataStr);
-          if (eventType === 'progress') {
-            if (data && data.msg) {
-              console.log(`[Paperec] ${data.msg}`);
-              toast(data.msg, 'info', 1800);
-            }
-            if (data.step === 'ranked') {
-              applyRanking(data.ranked_ids, 'progress/ranked');
-            }
-          } else if (eventType === 'result') {
-            applyRanking(data.ranked_ids, 'result');
-          } else if (eventType === 'error') {
-            const msg = `Server error: ${data.msg}`;
-            console.error('[Paperec]', msg);
-            toast(msg, 'error', 4800);
+      const parseEvents = (chunk) => {
+        buffer += chunk;
+        // SSE events are separated by double newline
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop(); // last (possibly incomplete) chunk stays
+        for (const raw of parts) {
+          let eventType = 'message';
+          let dataStr = '';
+          for (const line of raw.split('\n')) {
+            if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+            else if (line.startsWith('data: ')) dataStr = line.slice(6).trim();
           }
-        } catch (_) {
-          // ignore malformed SSE lines
+          if (!dataStr) continue;
+          try {
+            const data = JSON.parse(dataStr);
+            if (eventType === 'progress') {
+              if (data && data.msg) {
+                console.log(`[Paperec] ${data.msg}`);
+                toast(data.msg, 'info', 4200);
+              }
+              if (data.step === 'ranked') {
+                applyRanking(data.ranked_ids, 'progress/ranked');
+              }
+            } else if (eventType === 'result') {
+              applyRanking(data.ranked_ids, 'result');
+            } else if (eventType === 'error') {
+              const msg = `Server error: ${data.msg}`;
+              console.error('[Paperec]', msg);
+              toast(msg, 'error', 4800);
+            }
+          } catch (_) {
+            // ignore malformed SSE lines
+          }
         }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parseEvents(decoder.decode(value, { stream: true }));
       }
-    };
+      // Flush remaining
+      parseEvents(decoder.decode());
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      parseEvents(decoder.decode(value, { stream: true }));
-    }
-    // Flush remaining
-    parseEvents(decoder.decode());
-
-    if (!hasAppliedRanking) {
-      const msg = 'Stream ended without ranked IDs; page order unchanged.';
-      console.warn(`[Paperec] ${msg}`);
-      toast(msg, 'warning', 3600);
-    }
+      if (!hasAppliedRanking) {
+        const msg = 'Stream ended without ranked IDs; page order unchanged.';
+        console.warn(`[Paperec] ${msg}`);
+        toast(msg, 'warning', 4200);
+      }
     } finally {
       paperecInFlight = false;
+
+      if (queuedCandidateIds.length > 0) {
+        const queuedIds = normalizeRankedIds(queuedCandidateIds);
+        const preserveQueuedPrefix = queuedPreservePrefix;
+        queuedCandidateIds = [];
+        queuedPreservePrefix = false;
+
+        const currentIdSet = new Set(getCurrentPaperIds());
+        const runnableIds = queuedIds.filter(
+          (paperId) => currentIdSet.has(paperId) && !frozenOrderedIds.includes(paperId)
+        );
+
+        if (runnableIds.length > 0) {
+          log(`paperec: running queued request for ${runnableIds.length} candidate(s)`);
+          setTimeout(() => {
+            window.paperec(serverUrl, {
+              candidateIds: runnableIds,
+              preservePrefix: preserveQueuedPrefix || frozenOrderedIds.length > 0,
+              suppressBusyWarning: true,
+              requestSource: 'queued',
+            });
+          }, 0);
+        }
+      }
     }
   };
 
   log('bootstrap: script loaded, debug=' + debugEnabled);
   initPapers();
 
-  setTimeout(() => {
-    if (autoPaperecTriggered) return;
-    autoPaperecTriggered = true;
-    window.paperec();
-  }, 0);
+  scheduleRefreshReorder('bootstrap');
 
   // Re-scan when new paper nodes are injected (infinite scroll / group switch)
-  const observer = new MutationObserver(initPapers);
+  const observer = new MutationObserver((mutations) => {
+    const shouldRescan = mutations.some((mutation) => {
+      if (mutation.type !== 'childList') return false;
+
+      const target = mutation.target;
+      if (target instanceof Element && target.matches('div.papers')) {
+        return true;
+      }
+
+      return [...mutation.addedNodes].some(
+        (node) => node instanceof Element && (node.matches('div.papers') || node.querySelector('div.papers'))
+      );
+    });
+
+    if (!shouldRescan) return;
+    scheduleRefreshReorder('dynamic-refresh');
+  });
   observer.observe(document.body, { childList: true, subtree: true });
 })();

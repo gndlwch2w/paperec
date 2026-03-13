@@ -2,7 +2,6 @@ import asyncio
 import json
 from typing import Any
 
-import httpx
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +9,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from rank import rank_papers
-from venue import crawl_venue
 
 app = FastAPI(title="Paperec")
 
@@ -39,14 +37,18 @@ class RankRequest(BaseModel):
         ...,
         description="Full URL of the papers.cool venue page",
     )
-    meta: dict[str, PaperMeta] = Field(
+    candidate: dict[str, PaperMeta] = Field(
         default_factory=dict,
-        description="paper id to paper metadata",
+        description="paper id to paper metadata, to be ranked",
+    )
+    corpus: dict[str, PaperMeta] = Field(
+        default_factory=dict,
+        description="paper id to paper metadata, to be used as corpus for ranking",
     )
 
 
 @app.post("/rank")
-async def rank_endpoint(body: RankRequest):
+async def rank_endpoint_v2(body: RankRequest):
     async def sse(event: str, data: Any) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -58,13 +60,14 @@ async def rank_endpoint(body: RankRequest):
 
     async def stream():
         try:
-            yield await progress_sse("crawling", "Crawling venue page")
-            papers = await crawl_venue(body.venue_url)
-            if not papers:
-                yield await error_sse(f"No papers found at {body.venue_url}")
-                return
-
-            yield await progress_sse("crawled", f"Crawled {len(papers)} papers")
+            candidate_meta = {
+                str(k): (v.model_dump() if hasattr(v, "model_dump") else v)
+                for k, v in body.candidate.items()
+            }
+            corpus_meta = {
+                str(k): (v.model_dump() if hasattr(v, "model_dump") else v)
+                for k, v in body.corpus.items()
+            }
 
             def norm_paper(
                 paper_id: str,
@@ -77,57 +80,67 @@ async def rank_endpoint(body: RankRequest):
                     merged["date"] = "1970-01-01T00:00:00Z"
                 return merged
 
-            candidate: list[dict[str, Any]] = [
-                norm_paper(str(paper["id"]), paper)
-                for paper in papers
-                if isinstance(paper, dict) and paper.get("id")
-            ]
-            crawled_map: dict[str, dict[str, Any]] = {
-                str(paper["id"]): paper for paper in candidate
-            }
+            candidate_ids_in_order: list[str] = []
+            candidate: list[dict[str, Any]] = []
+            for paper_id, meta in candidate_meta.items():
+                if not isinstance(meta, dict):
+                    continue
+                candidate_ids_in_order.append(paper_id)
+                candidate.append(norm_paper(paper_id, meta))
 
-            yield await progress_sse("ranking", "Ranking papers")
-            rated_meta = {
-                k: (v.model_dump() if hasattr(v, "model_dump") else v)
-                for k, v in body.meta.items()
-            }
-            rated_ids: set[str] = {
+            if not candidate:
+                yield await error_sse("No candidate papers found in request")
+                return
+
+            rated_corpus_ids: list[str] = [
                 paper_id
-                for paper_id, meta in rated_meta.items()
+                for paper_id, meta in corpus_meta.items()
                 if isinstance(meta, dict)
                 and isinstance(meta.get("rating"), int)
                 and meta["rating"] > 0
-            }
+            ]
 
             corpus: list[dict[str, Any]] = []
-            for paper_id in rated_ids:
-                merged: dict[str, Any] = {}
-                crawled_paper = crawled_map.get(paper_id)
-                if crawled_paper is not None:
-                    merged.update(crawled_paper)
-                meta = rated_meta.get(paper_id)
+            for paper_id in rated_corpus_ids:
+                meta = corpus_meta.get(paper_id)
                 if isinstance(meta, dict):
-                    merged.update(meta)
-                if merged:
-                    corpus.append(norm_paper(paper_id, merged))
+                    corpus.append(norm_paper(paper_id, meta))
 
             if not corpus:
-                yield await error_sse("No rated papers found in request")
+                yield await error_sse("No rated corpus papers found in request")
                 return
+
+            yield await progress_sse(
+                "ranking",
+                f"Ranking {len(candidate)} candidates using {len(corpus)} rated corpus papers",
+            )
 
             loop = asyncio.get_running_loop()
             ranked_ids: list[str] = await loop.run_in_executor(
                 None,
                 lambda: rank_papers(candidate, corpus),
             )
+
+            candidate_id_set = set(candidate_ids_in_order)
+            normalized_ranked: list[str] = []
+            ranked_seen: set[str] = set()
+            for paper_id in ranked_ids:
+                normalized = str(paper_id)
+                if normalized in candidate_id_set and normalized not in ranked_seen:
+                    ranked_seen.add(normalized)
+                    normalized_ranked.append(normalized)
+
+            # Ensure output covers all candidates, even if ranker omits some IDs.
+            for paper_id in candidate_ids_in_order:
+                if paper_id not in ranked_seen:
+                    normalized_ranked.append(paper_id)
+
             yield await progress_sse(
                 "ranked",
-                f"Ranked {len(ranked_ids)} papers",
-                ranked_ids=ranked_ids,
+                f"Ranked {len(normalized_ranked)} candidate papers",
+                ranked_ids=normalized_ranked,
             )
-        except httpx.HTTPStatusError as exc:
-            code = exc.response.status_code
-            yield await error_sse(f"HTTP {code}: {body.venue_url}")
+            yield await sse("result", {"ranked_ids": normalized_ranked})
         except Exception as exc:
             yield await error_sse(f"Unexpected error: {str(exc)}")
 
