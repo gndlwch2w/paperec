@@ -7,7 +7,9 @@ Paperec adds paper rating and personalized recommendation to papers.cool.
 Clone the repository and start the local server with one command: 
 
 ```bash
-git clone https://github.com/gndlwch2w/paperec.git && cd paperec && bash install.sh && source .venv/bin/activate && bash run.sh
+git clone https://github.com/gndlwch2w/paperec.git && \
+ cd paperec && bash install.sh && \
+ source .venv/bin/activate && bash run.sh
 ```
 
 #### Client
