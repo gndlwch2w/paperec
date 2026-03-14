@@ -1,6 +1,6 @@
 ## Paperec
 
-Paperec adds paper rating and personalized recommendation to papers.cool.
+Paperec adds paper rating and personalized recommendation to <a href="https://papers.cool/">papers.cool</a>.
 
 #### Installation
 
