@@ -2,7 +2,7 @@
 // @name         paperec
 // @description  Paper recommendation and rating system for papers.cool
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.0.1
 // @author       Chisheng Chen
 // @match        https://papers.cool/arxiv/*
 // @match        https://papers.cool/venue/*

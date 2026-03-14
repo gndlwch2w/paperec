@@ -1,0 +1,102 @@
+name: Sync paperec.js to GreasyFork
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - paperec.js
+  workflow_dispatch:
+
+jobs:
+  greasyfork-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect @version change in paperec.js
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          new_version="$(sed -nE 's|^//[[:space:]]*@version[[:space:]]+(.+)$|\1|p' paperec.js | head -n1 | xargs)"
+          if [[ -z "${new_version}" ]]; then
+            echo "Could not find @version in paperec.js" >&2
+            exit 1
+          fi
+
+          old_version=""
+          before_sha="${{ github.event.before }}"
+          if [[ -n "${before_sha}" && "${before_sha}" != "0000000000000000000000000000000000000000" ]]; then
+            if git cat-file -e "${before_sha}:paperec.js" 2>/dev/null; then
+              old_version="$(git show "${before_sha}:paperec.js" | sed -nE 's|^//[[:space:]]*@version[[:space:]]+(.+)$|\1|p' | head -n1 | xargs || true)"
+            fi
+          fi
+
+          if [[ "${old_version}" == "${new_version}" ]]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "message=paperec.js changed but @version stayed at ${new_version}; skip GreasyFork sync." >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            echo "message=@version changed: ${old_version:-<none>} -> ${new_version}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Print sync decision
+        shell: bash
+        run: echo "${{ steps.version.outputs.message }}"
+
+      - name: Notify GreasyFork webhook
+        if: steps.version.outputs.changed == 'true'
+        env:
+          GREASYFORK_WEBHOOK_URL: ${{ secrets.GREASYFORK_WEBHOOK_URL }}
+          GREASYFORK_WEBHOOK_SECRET: ${{ secrets.GREASYFORK_WEBHOOK_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GREASYFORK_WEBHOOK_URL}" || -z "${GREASYFORK_WEBHOOK_SECRET}" ]]; then
+            echo "Missing GREASYFORK_WEBHOOK_URL or GREASYFORK_WEBHOOK_SECRET secrets." >&2
+            exit 1
+          fi
+
+          payload_file="${GITHUB_EVENT_PATH}"
+          signature="$(openssl dgst -sha1 -hmac "${GREASYFORK_WEBHOOK_SECRET}" "${payload_file}" | awk '{print $2}')"
+
+          response_file="$(mktemp)"
+          http_code="$({
+            curl --silent --show-error --location \
+              --output "${response_file}" \
+              --write-out "%{http_code}" \
+              --request POST "${GREASYFORK_WEBHOOK_URL}" \
+              --header "Content-Type: application/json" \
+              --header "X-GitHub-Event: push" \
+              --header "X-Hub-Signature: sha1=${signature}" \
+              --header "User-Agent: GitHub-Hookshot" \
+              --data-binary "@${payload_file}"
+          })"
+
+          cat "${response_file}"
+
+          if [[ "${http_code}" -lt 200 || "${http_code}" -ge 300 ]]; then
+            echo "GreasyFork webhook failed with HTTP ${http_code}" >&2
+            exit 1
+          fi
+
+          if jq empty "${response_file}" >/dev/null 2>&1; then
+            failed_count="$(jq '.updated_failed // [] | length' "${response_file}")"
+            if [[ "${failed_count}" -gt 0 ]]; then
+              echo "GreasyFork reported failed updates." >&2
+              jq '.' "${response_file}" >&2 || true
+              exit 1
+            fi
+          else
+            echo "GreasyFork returned non-JSON body; skip strict verification."
+          fi
