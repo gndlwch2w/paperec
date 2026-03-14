@@ -14,7 +14,7 @@ git clone https://github.com/gndlwch2w/paperec.git && \
 
 #### Client
 
-Install `paperec.js` in Tampermonkey, then open any `https://papers.cool/venue/*` page.
+Install `paperec.js` in Tampermonkey, then open any `https://papers.cool/venue/*` or `https://papers.cool/arxiv/*` page.
 
 #### Usage
 

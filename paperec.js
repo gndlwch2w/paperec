@@ -4,6 +4,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @author       Chisheng Chen
+// @match        https://papers.cool/arxiv/*
 // @match        https://papers.cool/venue/*
 // @license      MIT License
 // @grant        none
@@ -14,13 +15,22 @@
 
   const PAPERS_KEY = 'paperec_papers';
   const DEBUG_KEY = 'paperec_debug';
+  const SETTINGS_KEY = 'paperec_settings';
   const TOAST_ROOT_ID = 'paperec-toast-root';
+  const CONTROL_BAR_ID = 'app-bar-paperec';
+  const CONTROL_BAR_BUTTON_ID = 'app-bar-paperec-btn';
   const PAPEREC_SERVER = 'https://113.55.8.157:8765';
+  const DEFAULT_SETTINGS = Object.freeze({
+    recommendationEnabled: true,
+    serverUrl: PAPEREC_SERVER,
+  });
 
   // Enable via: localStorage.setItem('paperec_debug','1') then reload,
   // or at runtime: window.paperecDebug(true)
   let debugEnabled = localStorage.getItem(DEBUG_KEY) === '1';
   let storageWriteWarned = false;
+  let settingsWriteWarned = false;
+  let controlBarUi = null;
   const log = (...args) => debugEnabled && console.log('[Paperec]', ...args);
   const warn = (...args) => debugEnabled && console.warn('[Paperec]', ...args);
 
@@ -121,6 +131,54 @@
     }
   }
 
+  function normalizeServerUrl(url) {
+    const normalized = String(url || '').trim().replace(/\/+$/, '');
+    return normalized || PAPEREC_SERVER;
+  }
+
+  function isHttpUrl(value) {
+    try {
+      const parsed = new URL(value);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function normalizeSettings(settings = {}) {
+    return {
+      recommendationEnabled: settings.recommendationEnabled !== false,
+      serverUrl: normalizeServerUrl(settings.serverUrl),
+    };
+  }
+
+  function getCurrentSettings() {
+    return normalizeSettings(window.paperecSettings || DEFAULT_SETTINGS);
+  }
+
+  function getConfiguredServerUrl() {
+    return getCurrentSettings().serverUrl;
+  }
+
+  function saveSettings(patch = {}) {
+    const next = normalizeSettings({
+      ...getCurrentSettings(),
+      ...patch,
+    });
+    window.paperecSettings = next;
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
+      settingsWriteWarned = false;
+    } catch (error) {
+      if (!settingsWriteWarned) {
+        settingsWriteWarned = true;
+        console.warn('[Paperec] failed to persist settings', error);
+        toast('Cannot persist Paperec settings to localStorage.', 'warning', 3600);
+      }
+    }
+    return next;
+  }
+
   function isValidRating(value) {
     return Number.isInteger(value) && value >= 1 && value <= 5;
   }
@@ -164,6 +222,8 @@
     );
   }
 
+  window.paperecSettings = normalizeSettings(readJson(SETTINGS_KEY));
+
   window.paperMeta = readJson(PAPERS_KEY);
   Object.keys(window.paperMeta).forEach((paperId) => {
     window.paperMeta[paperId] = normalizePaperMeta(window.paperMeta[paperId]);
@@ -191,6 +251,7 @@
         toast('Cannot persist ratings in localStorage; page features still work in this session.', 'warning', 4200);
       }
     }
+    refreshControlBarUi();
   }
 
   syncRatingsFromMeta();
@@ -402,6 +463,7 @@
     window.paperMeta = {};
     syncRatingsFromMeta();
     localStorage.removeItem(PAPERS_KEY);
+    refreshControlBarUi();
     console.log('[Paperec] paper meta cleared');
   };
 
@@ -414,6 +476,433 @@
       'paperec_meta.json'
     );
     return window.paperMeta;
+  };
+
+  function getRatedPaperEntries() {
+    return Object.entries(getPersistedPaperMeta())
+      .map(([paperId, meta]) => ({
+        paperId,
+        meta: normalizePaperMeta(meta),
+      }))
+      .sort((a, b) => {
+        const ratingDiff = (b.meta.rating || 0) - (a.meta.rating || 0);
+        if (ratingDiff !== 0) return ratingDiff;
+        return (b.meta.date || '').localeCompare(a.meta.date || '');
+      });
+  }
+
+  function exportRatedPapers() {
+    const rated = getPersistedPaperMeta();
+    const count = Object.keys(rated).length;
+    if (!count) {
+      toast('No rated papers to export.', 'warning', 3200);
+      return rated;
+    }
+
+    const timestamp = nowUtcTimestamp().replace(/[:]/g, '-');
+    downloadBlob(
+      new Blob([JSON.stringify(rated, null, 2)], { type: 'application/json' }),
+      `paperec_rated_${timestamp}.json`
+    );
+    toast(`Exported ${count} rated paper(s).`, 'success', 3200);
+    return rated;
+  }
+
+  window.exportRatedPapers = exportRatedPapers;
+
+  window.getRatedPapers = function () {
+    return getRatedPaperEntries().map(({ paperId, meta }) => ({ paperId, ...meta }));
+  };
+
+  function createToolbarButton(text, onClick) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  function setToolbarButtonEnabled(button, enabled) {
+    if (!button) return;
+    button.disabled = !enabled;
+  }
+
+  function updateRecommendToggleButton(button, enabled) {
+    if (!button) return;
+
+    button.innerHTML = enabled
+      ? '<i class="fa fa-toggle-on"></i> 推荐开启'
+      : '<i class="fa fa-toggle-off"></i> 推荐关闭';
+    button.title = enabled ? '点击关闭推荐' : '点击开启推荐';
+    button.style.color = '#fff';
+    button.style.border = 'none';
+    button.style.borderRadius = '4px';
+    button.style.padding = '6px 10px';
+    button.style.minWidth = '116px';
+    button.style.backgroundColor = enabled ? '#32a852' : '#d9534f';
+  }
+
+  function renderRatedPaperList() {
+    if (!controlBarUi) return;
+
+    const entries = getRatedPaperEntries();
+    const listRoot = controlBarUi.ratedList;
+    listRoot.innerHTML = '';
+
+    if (!entries.length) {
+      const empty = document.createElement('p');
+      empty.textContent = '暂无已评分文章';
+      empty.style.cssText = 'margin: 0; font-size: 14px;';
+      listRoot.appendChild(empty);
+      return;
+    }
+
+    entries.forEach(({ paperId, meta }, idx) => {
+      const row = document.createElement('p');
+      row.style.cssText = 'margin: 0 0 12px 0; font-size: 14px; font-weight: bold;';
+
+      const index = document.createElement('span');
+      index.className = 'i-index';
+      index.textContent = `#${idx + 1}`;
+      index.style.cssText = 'color: purple; font-weight: bold; padding-right: 3px;';
+
+      const title = document.createElement('a');
+      title.className = 'i-title';
+      title.href = `#${paperId}`;
+      title.textContent = meta.title || paperId;
+      title.style.cssText = [
+        'display: inline-block',
+        'max-width: calc(100% - 60px)',
+        'white-space: nowrap',
+        'overflow: hidden',
+        'text-overflow: ellipsis',
+        'vertical-align: bottom',
+        'color: #32a852',
+      ].join(';');
+      if (meta.date) {
+        title.title = `${paperId} · ${meta.date}`;
+      }
+
+      const rating = document.createElement('span');
+      rating.textContent = `★${meta.rating}`;
+      rating.style.cssText = 'color: #f0a500; float: right;';
+
+      row.appendChild(index);
+      row.appendChild(title);
+      row.appendChild(rating);
+      listRoot.appendChild(row);
+    });
+  }
+
+  function refreshControlBarUi() {
+    if (!controlBarUi || !controlBarUi.root.isConnected) return;
+
+    const settings = getCurrentSettings();
+    const ratedCount = Object.keys(getPersistedPaperMeta()).length;
+    controlBarUi.ratedSummary.textContent = `已评分文章 (${ratedCount})`;
+    updateRecommendToggleButton(controlBarUi.recommendToggleButton, settings.recommendationEnabled);
+
+    if (document.activeElement !== controlBarUi.serverInput) {
+      controlBarUi.serverInput.value = settings.serverUrl;
+    }
+
+    renderRatedPaperList();
+  }
+
+  function persistServerFromInput() {
+    if (!controlBarUi) return false;
+
+    const candidateUrl = normalizeServerUrl(controlBarUi.serverInput.value);
+    if (!isHttpUrl(candidateUrl)) {
+      toast('Server URL must start with http:// or https://', 'warning', 3600);
+      return false;
+    }
+
+    const currentServer = getConfiguredServerUrl();
+    if (candidateUrl === currentServer) {
+      refreshControlBarUi();
+      return true;
+    }
+
+    saveSettings({ serverUrl: candidateUrl });
+    refreshControlBarUi();
+    toast(`Server updated: ${candidateUrl}`, 'success', 3200);
+    return true;
+  }
+
+  function setControlBarPresentation(root, mode) {
+    if (mode === 'app-bar') {
+      root.classList.add('app-bar-content');
+      root.style.cssText = 'display: none;';
+      return;
+    }
+
+    root.classList.remove('app-bar-content');
+    root.style.cssText = [
+      'margin: 10px 0 12px',
+      'padding: 10px 12px',
+      'border: 1px solid #e5e7eb',
+      'border-radius: 8px',
+      'background: #f8fafc',
+      'font-size: 13px',
+      'line-height: 1.45',
+      'color: #111827',
+    ].join(';');
+  }
+
+  function createControlBar() {
+    const root = document.createElement('div');
+    root.id = CONTROL_BAR_ID;
+    setControlBarPresentation(root, 'standalone');
+
+    const title = document.createElement('p');
+    title.innerHTML = '<strong>Paperec</strong>';
+
+    const recommendToggleButton = createToolbarButton('', () => {
+      const nextEnabled = !getCurrentSettings().recommendationEnabled;
+      const next = saveSettings({ recommendationEnabled: nextEnabled });
+      refreshControlBarUi();
+      if (next.recommendationEnabled) {
+        toast('Recommendation enabled.', 'success', 2800);
+        scheduleRefreshReorder('toolbar-toggle');
+      } else {
+        toast('Recommendation disabled.', 'info', 2800);
+      }
+    });
+    updateRecommendToggleButton(recommendToggleButton, getCurrentSettings().recommendationEnabled);
+
+    const exportButton = createToolbarButton('导出已评分', () => {
+      exportRatedPapers();
+    });
+    exportButton.style.minWidth = '116px';
+
+    const ratedSummary = document.createElement('p');
+    ratedSummary.textContent = '已评分文章 (0)';
+
+    const ratedList = document.createElement('div');
+    ratedList.className = 'items';
+    ratedList.style.cssText = [
+      'border: 1px solid #ddd',
+      'height: 150px',
+      'border-radius: 5px',
+      'padding: 8px',
+      'overflow-y: auto',
+      'box-sizing: border-box',
+    ].join(';');
+
+    const serverLabel = document.createElement('p');
+    serverLabel.textContent = 'Server';
+
+    const serverInput = document.createElement('input');
+    serverInput.type = 'text';
+    serverInput.className = 'text-input single-line';
+    serverInput.value = getConfiguredServerUrl();
+    serverInput.placeholder = 'https://host:port';
+
+    const saveServerButton = createToolbarButton('保存', () => {
+      persistServerFromInput();
+    });
+    saveServerButton.style.minWidth = '116px';
+    const resetServerButton = createToolbarButton('默认', () => {
+      saveSettings({ serverUrl: PAPEREC_SERVER });
+      refreshControlBarUi();
+      toast(`Server reset: ${PAPEREC_SERVER}`, 'info', 3200);
+    });
+    resetServerButton.style.minWidth = '116px';
+
+    serverInput.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      persistServerFromInput();
+      serverInput.blur();
+    });
+    serverInput.addEventListener('blur', () => {
+      persistServerFromInput();
+    });
+
+    const allActions = document.createElement('div');
+    allActions.className = 'submit';
+    allActions.style.gap = '8px';
+    allActions.style.marginTop = '16px';
+
+    function wrapActionButton(button) {
+      const wrapper = document.createElement('p');
+      wrapper.style.justifyContent = 'center';
+      wrapper.style.margin = '0';
+      wrapper.appendChild(button);
+      return wrapper;
+    }
+
+    allActions.appendChild(wrapActionButton(recommendToggleButton));
+    allActions.appendChild(wrapActionButton(exportButton));
+    allActions.appendChild(wrapActionButton(saveServerButton));
+    allActions.appendChild(wrapActionButton(resetServerButton));
+
+    root.appendChild(title);
+    root.appendChild(ratedSummary);
+    root.appendChild(ratedList);
+    root.appendChild(serverLabel);
+    root.appendChild(serverInput);
+    root.appendChild(allActions);
+
+    return {
+      root,
+      recommendToggleButton,
+      ratedSummary,
+      ratedList,
+      serverInput,
+    };
+  }
+
+  function syncAppBarButtonLayout(appBar) {
+    const buttons = [...appBar.querySelectorAll('a.bar-app')]
+      .filter((a) => a.parentElement === appBar);
+    if (!buttons.length) return;
+
+    const width = `${(100 / buttons.length).toFixed(4)}%`;
+    buttons.forEach((btn) => {
+      btn.style.width = width;
+    });
+  }
+
+  function ensureControlBarButton(appBar) {
+    let button = document.getElementById(CONTROL_BAR_BUTTON_ID);
+    if (button && button.parentElement !== appBar) {
+      button.remove();
+      button = null;
+    }
+
+    if (!button) {
+      button = document.createElement('a');
+      button.id = CONTROL_BAR_BUTTON_ID;
+      button.className = 'bar-app';
+      button.href = '#';
+      button.title = 'Paperec';
+      button.innerHTML = '<i class="fa fa-compass"></i>';
+    }
+
+    if (!button.dataset.paperecBound) {
+      button.dataset.paperecBound = '1';
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        const panel = document.getElementById(CONTROL_BAR_ID);
+        if (!panel) return;
+
+        if (typeof window.toggleApp === 'function') {
+          window.toggleApp(CONTROL_BAR_ID, button);
+        } else {
+          const shouldOpen = panel.style.display === 'none';
+          panel.style.display = shouldOpen ? 'block' : 'none';
+          button.classList.toggle('active', shouldOpen);
+        }
+
+        setTimeout(() => {
+          refreshControlBarUi();
+        }, 0);
+      });
+    }
+
+    const configButton = [...appBar.querySelectorAll('a.bar-app')]
+      .find((a) => a.parentElement === appBar && a.title === 'Configuration');
+
+    if (configButton) {
+      if (button.parentElement !== appBar || button.nextElementSibling !== configButton) {
+        appBar.insertBefore(button, configButton);
+      }
+    } else if (button.parentElement !== appBar) {
+      appBar.appendChild(button);
+    }
+
+    syncAppBarButtonLayout(appBar);
+
+    return button;
+  }
+
+  function getControlBarMountTarget() {
+    const appBar = document.getElementById('app-bar');
+    if (appBar) {
+      return { anchor: appBar, position: 'inside-app-bar' };
+    }
+
+    const papers = document.querySelector('div.papers');
+    if (papers && papers.parentElement) {
+      return { anchor: papers, position: 'before' };
+    }
+
+    const main = document.querySelector('main');
+    if (main) {
+      return { anchor: main, position: 'prepend' };
+    }
+
+    return { anchor: document.body, position: 'prepend' };
+  }
+
+  function mountControlBar(root) {
+    const target = getControlBarMountTarget();
+    if (!target || !target.anchor) return;
+
+    const { anchor, position } = target;
+    if (position === 'inside-app-bar') {
+      setControlBarPresentation(root, 'app-bar');
+      const firstAppButton = [...anchor.querySelectorAll('a.bar-app')]
+        .find((a) => a.parentElement === anchor);
+      if (firstAppButton) {
+        if (root.parentElement !== anchor || root.nextElementSibling !== firstAppButton) {
+          anchor.insertBefore(root, firstAppButton);
+        }
+      } else if (root.parentElement !== anchor) {
+        anchor.appendChild(root);
+      }
+
+      if (controlBarUi) {
+        controlBarUi.triggerButton = ensureControlBarButton(anchor);
+      }
+      return;
+    }
+
+    setControlBarPresentation(root, 'standalone');
+    const existingButton = document.getElementById(CONTROL_BAR_BUTTON_ID);
+    if (existingButton) existingButton.remove();
+
+    if (position === 'before') {
+      if (root.nextElementSibling !== anchor) {
+        anchor.insertAdjacentElement('beforebegin', root);
+      }
+      return;
+    }
+
+    if (anchor.firstElementChild !== root) {
+      anchor.prepend(root);
+    }
+  }
+
+  function ensureControlBar() {
+    if (!controlBarUi || !controlBarUi.root.isConnected) {
+      const existing = document.getElementById(CONTROL_BAR_ID);
+      if (existing) existing.remove();
+      const existingButton = document.getElementById(CONTROL_BAR_BUTTON_ID);
+      if (existingButton) existingButton.remove();
+      controlBarUi = createControlBar();
+    }
+
+    mountControlBar(controlBarUi.root);
+    refreshControlBarUi();
+    return controlBarUi;
+  }
+
+  window.paperecSetServer = function (serverUrl) {
+    const normalized = normalizeServerUrl(serverUrl);
+    if (!isHttpUrl(normalized)) {
+      toast('Server URL must start with http:// or https://', 'warning', 3600);
+      return null;
+    }
+    saveSettings({ serverUrl: normalized });
+    refreshControlBarUi();
+    return normalized;
+  };
+
+  window.paperecGetSettings = function () {
+    return { ...getCurrentSettings() };
   };
 
   // ── Recommendation ────────────────────────────────────────────────────────
@@ -449,6 +938,12 @@
       const currentIds = getCurrentPaperIds();
       if (!currentIds.length) return;
 
+      const settings = getCurrentSettings();
+      if (!settings.recommendationEnabled) {
+        log('scheduleRefreshReorder: recommendation disabled by user setting');
+        return;
+      }
+
       const hasFrozenPrefix = frozenOrderedIds.length > 0;
       const candidateIds = hasFrozenPrefix
         ? currentIds.filter((id) => !frozenOrderedIds.includes(id))
@@ -459,10 +954,11 @@
         return;
       }
 
-      window.paperec(PAPEREC_SERVER, {
+      window.paperec(settings.serverUrl, {
         candidateIds,
         preservePrefix: hasFrozenPrefix,
         silentBusy: true,
+        silentDisabled: true,
         requestSource: reason,
       });
     }, REFRESH_SETTLE_MS);
@@ -542,13 +1038,33 @@
    * Send candidate papers + rated corpus to /rank_v2, stream progress events,
    * and reorder candidate region when the ranking result arrives.
    */
-  window.paperec = async function (serverUrl = PAPEREC_SERVER, options = {}) {
+  window.paperec = async function (serverUrl = getConfiguredServerUrl(), options = {}) {
     const candidateIdsRequested = Array.isArray(options.candidateIds)
       ? normalizeRankedIds(options.candidateIds)
       : getCurrentPaperIds();
     const preservePrefix = options.preservePrefix === true;
     const suppressBusyWarning = options.suppressBusyWarning === true || options.silentBusy === true;
+    const suppressDisabledWarning = options.silentDisabled === true;
+    const forceRun = options.force === true;
     const requestSource = typeof options.requestSource === 'string' ? options.requestSource : 'manual';
+    const settings = getCurrentSettings();
+    const effectiveServerUrl = normalizeServerUrl(serverUrl || settings.serverUrl);
+
+    if (!forceRun && !settings.recommendationEnabled) {
+      if (!suppressDisabledWarning) {
+        const msg = 'Recommendation is disabled in Paperec settings.';
+        console.warn(`[Paperec] ${msg}`);
+        toast(msg, 'warning', 3600);
+      }
+      return;
+    }
+
+    if (!isHttpUrl(effectiveServerUrl)) {
+      const msg = `Invalid server URL: ${effectiveServerUrl}`;
+      console.error('[Paperec]', msg);
+      toast(msg, 'error', 4200);
+      return;
+    }
 
     if (paperecInFlight) {
       if (candidateIdsRequested.length > 0) {
@@ -599,7 +1115,7 @@
 
       let resp;
       try {
-        resp = await fetch(`${serverUrl}/rank_v2`, {
+        resp = await fetch(`${effectiveServerUrl}/rank_v2`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -708,7 +1224,7 @@
         if (runnableIds.length > 0) {
           log(`paperec: running queued request for ${runnableIds.length} candidate(s)`);
           setTimeout(() => {
-            window.paperec(serverUrl, {
+            window.paperec(effectiveServerUrl, {
               candidateIds: runnableIds,
               preservePrefix: preserveQueuedPrefix || frozenOrderedIds.length > 0,
               suppressBusyWarning: true,
@@ -722,11 +1238,25 @@
 
   log('bootstrap: script loaded, debug=' + debugEnabled);
   initPapers();
+  ensureControlBar();
 
   scheduleRefreshReorder('bootstrap');
 
   // Re-scan when new paper nodes are injected (infinite scroll / group switch)
   const observer = new MutationObserver((mutations) => {
+    const shouldEnsureBar = !controlBarUi
+      || !controlBarUi.root.isConnected
+      || mutations.some((mutation) => {
+        if (mutation.type !== 'childList') return false;
+        return [...mutation.addedNodes].some((node) => {
+          if (!(node instanceof Element)) return false;
+          return node.matches('.app-bar, [class*="app-bar"], header, main')
+            || !!node.querySelector('.app-bar, [class*="app-bar"], header, main');
+        });
+      });
+
+    if (shouldEnsureBar) ensureControlBar();
+
     const shouldRescan = mutations.some((mutation) => {
       if (mutation.type !== 'childList') return false;
 
