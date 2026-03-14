@@ -2,7 +2,7 @@
 // @name         paperec
 // @description  Paper recommendation and rating system for papers.cool
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
+// @version      1.0.2
 // @author       Chisheng Chen
 // @match        https://papers.cool/arxiv/*
 // @match        https://papers.cool/venue/*
@@ -173,7 +173,7 @@
       if (!settingsWriteWarned) {
         settingsWriteWarned = true;
         console.warn('[Paperec] failed to persist settings', error);
-        toast('Cannot persist Paperec settings to localStorage.', 'warning', 3600);
+        toast('Cannot persist Paperec settings to localStorage', 'warning', 3600);
       }
     }
     return next;
@@ -248,7 +248,7 @@
       if (!storageWriteWarned) {
         storageWriteWarned = true;
         console.warn('[Paperec] failed to persist ratings to localStorage', error);
-        toast('Cannot persist ratings in localStorage; page features still work in this session.', 'warning', 4200);
+        toast('Cannot persist ratings in localStorage, page features still work in this session', 'warning', 4200);
       }
     }
     refreshControlBarUi();
@@ -495,7 +495,7 @@
     const rated = getPersistedPaperMeta();
     const count = Object.keys(rated).length;
     if (!count) {
-      toast('No rated papers to export.', 'warning', 3200);
+      toast('No rated papers to export', 'warning', 3200);
       return rated;
     }
 
@@ -504,7 +504,7 @@
       new Blob([JSON.stringify(rated, null, 2)], { type: 'application/json' }),
       `paperec_rated_${timestamp}.json`
     );
-    toast(`Exported ${count} rated paper(s).`, 'success', 3200);
+    toast(`Exported ${count} rated paper(s)`, 'success', 3200);
     return rated;
   }
 
@@ -531,9 +531,9 @@
     if (!button) return;
 
     button.innerHTML = enabled
-      ? '<i class="fa fa-toggle-on"></i> 推荐开启'
-      : '<i class="fa fa-toggle-off"></i> 推荐关闭';
-    button.title = enabled ? '点击关闭推荐' : '点击开启推荐';
+      ? '<i class="fa fa-toggle-on"></i> Enabled'
+      : '<i class="fa fa-toggle-off"></i> Disabled';
+    button.title = enabled ? 'Click to disable recommendations' : 'Click to enable recommendations';
     button.style.color = '#fff';
     button.style.border = 'none';
     button.style.borderRadius = '4px';
@@ -551,7 +551,7 @@
 
     if (!entries.length) {
       const empty = document.createElement('p');
-      empty.textContent = '暂无已评分文章';
+      empty.textContent = 'No rated papers yet';
       empty.style.cssText = 'margin: 0; font-size: 14px;';
       listRoot.appendChild(empty);
       return;
@@ -599,7 +599,7 @@
 
     const settings = getCurrentSettings();
     const ratedCount = Object.keys(getPersistedPaperMeta()).length;
-    controlBarUi.ratedSummary.textContent = `已评分文章 (${ratedCount})`;
+    controlBarUi.ratedSummary.textContent = `Rated Papers (${ratedCount})`;
     updateRecommendToggleButton(controlBarUi.recommendToggleButton, settings.recommendationEnabled);
 
     if (document.activeElement !== controlBarUi.serverInput) {
@@ -663,21 +663,21 @@
       const next = saveSettings({ recommendationEnabled: nextEnabled });
       refreshControlBarUi();
       if (next.recommendationEnabled) {
-        toast('Recommendation enabled.', 'success', 2800);
+        toast('Recommendation enabled', 'success', 2800);
         scheduleRefreshReorder('toolbar-toggle');
       } else {
-        toast('Recommendation disabled.', 'info', 2800);
+        toast('Recommendation disabled', 'info', 2800);
       }
     });
     updateRecommendToggleButton(recommendToggleButton, getCurrentSettings().recommendationEnabled);
 
-    const exportButton = createToolbarButton('导出已评分', () => {
+    const exportButton = createToolbarButton('Export Papers', () => {
       exportRatedPapers();
     });
     exportButton.style.minWidth = '116px';
 
     const ratedSummary = document.createElement('p');
-    ratedSummary.textContent = '已评分文章 (0)';
+    ratedSummary.textContent = 'Rated Papers (0)';
 
     const ratedList = document.createElement('div');
     ratedList.className = 'items';
@@ -699,11 +699,11 @@
     serverInput.value = getConfiguredServerUrl();
     serverInput.placeholder = 'https://host:port';
 
-    const saveServerButton = createToolbarButton('保存', () => {
+    const saveServerButton = createToolbarButton('Save', () => {
       persistServerFromInput();
     });
     saveServerButton.style.minWidth = '116px';
-    const resetServerButton = createToolbarButton('默认', () => {
+    const resetServerButton = createToolbarButton('Reset', () => {
       saveSettings({ serverUrl: PAPEREC_SERVER });
       refreshControlBarUi();
       toast(`Server reset: ${PAPEREC_SERVER}`, 'info', 3200);
@@ -1052,7 +1052,7 @@
 
     if (!forceRun && !settings.recommendationEnabled) {
       if (!suppressDisabledWarning) {
-        const msg = 'Recommendation is disabled in Paperec settings.';
+        const msg = 'Recommendation is disabled in Paperec settings';
         console.warn(`[Paperec] ${msg}`);
         toast(msg, 'warning', 3600);
       }
@@ -1072,7 +1072,7 @@
         log(`paperec busy; queued ${candidateIdsRequested.length} candidate(s) from ${requestSource}`);
       }
       if (!suppressBusyWarning) {
-        const msg = 'Recommendation request is already running.';
+        const msg = 'Recommendation request is already running';
         console.warn(`[Paperec] ${msg}`);
         toast(msg, 'warning');
       }
@@ -1085,7 +1085,7 @@
       const corpus = getPersistedPaperMeta();
       const corpusCount = Object.keys(corpus).length;
       if (!corpusCount) {
-        const msg = 'No ratings yet — rate some papers first.';
+        const msg = 'No ratings yet, rate some papers first';
         console.warn(`[Paperec] ${msg}`);
         toast(msg, 'warning');
         return;
@@ -1103,12 +1103,7 @@
         return;
       }
 
-      const payload = {
-        venue_url: location.href,
-        candidate,
-        corpus,
-      };
-
+      const payload = {candidate, corpus};
       const sendingMsg = `Ranking ${candidateCount} candidate(s) with ${corpusCount} rated paper(s)`;
       console.log(`[Paperec] ${sendingMsg}`);
       toast(sendingMsg, 'info', 4200);
@@ -1181,8 +1176,6 @@
               if (data.step === 'ranked') {
                 applyRanking(data.ranked_ids, 'progress/ranked');
               }
-            } else if (eventType === 'result') {
-              applyRanking(data.ranked_ids, 'result');
             } else if (eventType === 'error') {
               const msg = `Server error: ${data.msg}`;
               console.error('[Paperec]', msg);
@@ -1203,7 +1196,7 @@
       parseEvents(decoder.decode());
 
       if (!hasAppliedRanking) {
-        const msg = 'Stream ended without ranked IDs; page order unchanged.';
+        const msg = 'Stream ended without ranked IDs, page order unchanged';
         console.warn(`[Paperec] ${msg}`);
         toast(msg, 'warning', 4200);
       }

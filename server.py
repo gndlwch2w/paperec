@@ -11,12 +11,8 @@ from pydantic import BaseModel, Field
 from rank import rank_papers
 
 app = FastAPI(title="Paperec")
-
 app.add_middleware(
     CORSMiddleware,
-    # papers.cool is HTTPS; modern Chrome allows fetch() to localhost from HTTPS.
-    # If you hit mixed-content errors, either run behind a TLS reverse proxy or
-    # install a local CA cert and serve with --ssl-*.
     allow_origins=["https://papers.cool", "http://localhost", "http://127.0.0.1"],
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
@@ -33,10 +29,6 @@ class PaperMeta(BaseModel):
 
 
 class RankRequest(BaseModel):
-    venue_url: str = Field(
-        ...,
-        description="Full URL of the papers.cool venue page",
-    )
     candidate: dict[str, PaperMeta] = Field(
         default_factory=dict,
         description="paper id to paper metadata, to be ranked",
@@ -48,7 +40,7 @@ class RankRequest(BaseModel):
 
 
 @app.post("/rank")
-async def rank_endpoint_v2(body: RankRequest):
+async def rank_endpoint(body: RankRequest):
     async def sse(event: str, data: Any) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -69,10 +61,7 @@ async def rank_endpoint_v2(body: RankRequest):
                 for k, v in body.corpus.items()
             }
 
-            def norm_paper(
-                paper_id: str,
-                paper: dict[str, Any],
-            ) -> dict[str, Any]:
+            def norm_paper(paper_id: str, paper: dict[str, Any]) -> dict[str, Any]:
                 merged = {"id": paper_id, **paper}
                 if not merged.get("abstract"):
                     merged["abstract"] = ""
@@ -140,7 +129,6 @@ async def rank_endpoint_v2(body: RankRequest):
                 f"Ranked {len(normalized_ranked)} candidate papers",
                 ranked_ids=normalized_ranked,
             )
-            yield await sse("result", {"ranked_ids": normalized_ranked})
         except Exception as exc:
             yield await error_sse(f"Unexpected error: {str(exc)}")
 

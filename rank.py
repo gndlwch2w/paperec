@@ -44,7 +44,7 @@ def generate_cache_id(model: str, paper: dict) -> str | None:
 
 
 # fmt: off
-def rerank_paper_by_date(
+def rank_papers_by_date(
     candidate: list[dict],
     corpus: list[dict],
     model: str = "avsolatorio/GIST-small-Embedding-v0",
@@ -90,4 +90,4 @@ def rerank_paper_by_date(
     return list(map(lambda x: x["id"], candidate))
 # fmt: on
 
-rank_papers = rerank_paper_by_date
+rank_papers = rank_papers_by_date
